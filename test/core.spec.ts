@@ -173,7 +173,7 @@ test('reason codes stay machine readable', () => {
   assert.equal(decision.strength, 'explicit')
 })
 
-test('a failed attach leaves the Eval open and locks the whole Thread', () => {
+test('a refused attach releases the Eval instead of locking the Thread', () => {
   const lab = new Lab({ ownership: 'routed' })
   const first = lab.receive({ text: '帮我写封道歉邮件' }).trigger
   lab.tick()
@@ -185,16 +185,31 @@ test('a failed attach leaves the Eval open and locks the whole Thread', () => {
   // The stop's let-go requeues the message the stopped ticket owned but never took up.
   const orphan = lab.receive({ text: '邮件语气再软一点' }).trigger
   lab.tick()
-  const card = lab.card(orphan.id)!
-  assert.ok(card, 'the orphan is queued again')
-  // Attaching it back to the stopped ticket fails, and the Eval stays in progress.
+  assert.ok(lab.card(orphan.id), 'the orphan is queued again')
+  // Attaching it back to the stopped ticket fails; the tool must release the Eval it was holding.
   const refused = (lab.route([{ kind: 'attach', trigger_id: orphan.id, ticket_id: ticketId }]) as Record<string, unknown>[])[0]!
   assert.match(String(refused.refused), /stopped/i)
-  assert.ok(lab.repo.threads.get(lab.threadKey)!.evaluating, 'the Eval did not finish')
-  // The Thread stays locked: the next message cannot even start an Eval until the stuck one ends or expires.
+  assert.equal(lab.repo.threads.get(lab.threadKey)!.evaluating, undefined, 'the Eval finished')
+  const decision = lab.decisionOf(orphan.id)!
+  assert.equal(decision.kind, 'ignore')
+  assert.match(reasonText(decision.reason), /Routing refused/)
+  // The next message is seen at once instead of waiting for the assessment timeout.
   const next = lab.receive({ text: '帮我看看 PR 42' }).trigger
   lab.tick()
-  assert.equal(lab.card(next.id), undefined, 'no candidate for the new message')
-  assert.deepEqual(lab.repo.threads.get(lab.threadKey)!.pending, [next.id], 'it waits behind the stuck Eval')
-  assert.deepEqual(lab.repo.threads.get(lab.threadKey)!.evaluating!.triggerIds, [orphan.id], 'the orphan still holds the Eval')
+  assert.ok(lab.card(next.id), 'the Thread kept moving')
+})
+
+test('Engine.attach releases the Eval by itself, for callers outside the tool', () => {
+  const lab = new Lab({ ownership: 'routed' })
+  const first = lab.receive({ text: '帮我写封道歉邮件' }).trigger
+  lab.tick()
+  lab.route([accept('道歉邮件', { trigger_id: first.id })])
+  const ticketId = lab.tickets()[0]!.id
+  const stop = lab.receive({ text: '算了不写了' }).trigger
+  lab.tick()
+  lab.route([{ kind: 'stop', trigger_id: stop.id, ticket_id: ticketId }])
+  const orphan = lab.receive({ text: '邮件语气再软一点' }).trigger
+  lab.tick()
+  assert.throws(() => lab.engine.attach(ticketId, orphan.id))
+  assert.equal(lab.repo.threads.get(lab.threadKey)!.evaluating, undefined)
 })

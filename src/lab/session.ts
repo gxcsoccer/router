@@ -22,6 +22,10 @@ export interface LabOptions {
   cardStyle?: 'full' | 'index'
   /** Personal-agent runs may leave `worktree_name` out of an accept. */
   requireWorktreeName?: boolean
+  /** `primary` accepts only the Trigger being decided; the rest of a batch waits for its own Eval. */
+  acceptBatch?: 'all' | 'primary'
+  /** Choose the part of a Thread's queue to evaluate now (see `splitBatches`). */
+  batchSplitter?: (triggers: readonly Trigger[]) => readonly Trigger[]
 }
 
 export interface TriggerInput {
@@ -68,6 +72,8 @@ export class Lab {
       executor: this.executor,
       outbox: this.outbox,
       ownership: options.ownership ?? 'thread',
+      ...options.acceptBatch ? { acceptBatch: options.acceptBatch } : {},
+      ...options.batchSplitter ? { batchSplitter: options.batchSplitter } : {},
       emit: event => { this.events.push(event) },
     })
     const engine = this.engine
@@ -78,6 +84,7 @@ export class Lab {
       decisionOf: id => this.repo.triggers.disposition(id)?.decisionId,
       requestPass: () => { this.passes.requested++ },
       quietly: run => run(),
+      release: (triggerId, reason) => engine.releaseRouting(triggerId, reason),
     }
   }
 

@@ -25,6 +25,17 @@ export interface EngineOptions {
    * Non-human Triggers (bots, CI) still fan out in both modes: they are context, never authority.
    */
   ownership?: 'thread' | 'routed'
+  /**
+   * [router-lab] Whether an accept takes the whole Eval batch into its ticket (`all`, the original semantics: the batch is
+   * one request) or only the Trigger being decided (`primary`), leaving the rest queued for their own Eval. Use `primary`
+   * where one Thread carries unrelated requests, such as a personal chat stream.
+   */
+  acceptBatch?: 'all' | 'primary'
+  /**
+   * [router-lab] Pick the part of a Thread's queued Triggers to evaluate now; the rest stay queued for the next Eval. Lets a
+   * host split a burst of unrelated messages before they become one atomic batch (see `splitBatches` in the lab).
+   */
+  batchSplitter?: (triggers: readonly Trigger[]) => readonly Trigger[]
 }
 
 /**

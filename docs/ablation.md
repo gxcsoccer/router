@@ -89,6 +89,29 @@ cascade: 规则首判（寒暄/叫停/唯一命中）  # 调用 −10%，准确�
 
 对应的一份实现就是 v8 + 动态卡片；如果更看重准确率而不是调用成本，用 v2。
 
+
+## 8. 三个缺口的修复与验证（第六轮）
+
+上一版结论里留了三个缺口，这一轮都做成了可开关的实现，并在同一套语料上验证。
+
+| 缺口 | 修复 | 验证 |
+|---|---|---|
+| 被拒的路由命令锁住整个 Thread | `Engine.attach` 在拒绝后**用第二个事务** `releaseRouting`（第一个事务已回滚）；`orchestrator_route` 对任何 `UserError` 调用 `host.release`；被拒的 Trigger 记一条 `ignore{notAttachable}` | 两个测试：拒绝后 `evaluating` 为空、下一条消息立刻拿到卡片；`Engine.attach` 直连调用也会自愈 |
+| 一条 accept 决定整批 | 两个开关：`acceptBatch: 'primary'`（只接收当前 Trigger，其余重新排队）与 `batchSplitter`（按相邻消息相似度切批，`splitBatches`） | 三条无关请求同批：默认 **1/3、swept 2**；`primary` **3/3、swept 0**；`splitter` **3/3、swept 0**。真实模型同一份"三个 accept"的输出，在 `primary` 下真的产出 3 张票 |
+| 第 9 个任务起不可见 | 卡片 = 最近 8 张 + 关键词命中的旧票（最多 4 张，标 `recall: 'keyword'`） | `many-tasks` 严格 10.3 → **11.3/12**（三次采样），重复建票消失；无关键词重合时卡片仍是 8 张 |
+| 级联首判从关键词换成 embedding | 无依赖的哈希 n-gram embedding（512 维，2–3 gram，L2 归一化）+ 上下文（最近两条消息）+ 阈值 0.14 / 间隔 0.02（在窗口 A 校准，窗口 B 验证 0 误判） | **负结果**：v3e 36/60、6 条串台；v8e 19/60、27 条串台，比关键词级联更差。原因有二：这个"embedding"只是平滑的词面重合，不是语义向量；阈值是在 fixture 的短标题上校准的，换到模型生成的长标题后分布漂移。实现保留、默认关闭 |
+
+结论：**前三个缺口可以关掉，第四个不能。** 级联的结构是对的，但首判必须换成真正的向量模型，并且必须在**线上票标题**上重新校准阈值；哈希 n-gram 只能证明结构，不能带来收益。
+
+新增开关（默认全关，行为与原实现一致）：
+
+```ts
+new Engine({ ..., acceptBatch: 'primary', batchSplitter: splitBatches })
+new Lab({ ..., cardStyle: 'index', acceptBatch: 'primary', batchSplitter: splitBatches })
+```
+
+测试从 34 增至 **37**：拒绝释放、`primary` 单批多票、切批、召回、embedding 排序、向量级联拦截。
+
 ## 6. 复现
 
 ```bash

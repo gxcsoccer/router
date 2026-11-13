@@ -89,10 +89,13 @@ export class Evals extends EnginePart {
     const startedTicket = (id: string): Reason => ({ code: 'startedTicket', triggerId: id, values: { ticket: accepted.get(id)!.ticketId! } })
     if (started.length) this.ignore(thread, started, started.map(startedTicket), policy, at)
     const triggers = thread.pending.flatMap(id => { const trigger = this.repo.triggers.get(id); return trigger ? [trigger] : [] })
+    // [router-lab] A host may split a burst: only the chosen Triggers start this Eval; the rest stay queued for the next one.
+    const chosen = this.options.batchSplitter?.(triggers) ?? triggers
+    const chosenIds = new Set(chosen.map(trigger => trigger.id))
     const tickets = this.ticketsOnThread(thread)
     const reasons: Reason[] = []
     let strongest: { trigger: Trigger; strength: Strength; basis: MandateBasis } | undefined
-    for (const trigger of triggers) {
+    for (const trigger of chosen) {
       const gate = policy.gate(trigger, thread, tickets)
       if (!gate.admissible) { reasons.push({ code: gate.reason, triggerId: trigger.id }); continue }
       const later = gate.strength === strongest?.strength && trigger.at >= strongest.trigger.at
@@ -100,18 +103,18 @@ export class Evals extends EnginePart {
       if (weaker || later) strongest = { trigger, strength: gate.strength, basis: gate.basis }
     }
     if (!strongest) {
-      if (thread.pending.length) this.ignore(thread, [...thread.pending], reasons.length ? reasons : [{ code: 'noAdmissible' }], policy, at)
+      if (chosen.length) this.ignore(thread, chosen.map(trigger => trigger.id), reasons.length ? reasons : [{ code: 'noAdmissible' }], policy, at)
       this.repo.threads.save(thread)
       return
     }
-    const evalId = key('eval', thread.key, policy.version, at, ...thread.pending)
+    const evalId = key('eval', thread.key, policy.version, at, ...chosen.map(trigger => trigger.id))
     const deadline = new Date(Date.parse(at) + policy.evalTimeoutMs).toISOString()
     const { strength, trigger: { actor }, basis } = strongest
-    thread.evaluating = { id: evalId, threadKey: thread.key, triggerIds: thread.pending, primary: strongest.trigger.id, strength, actor, basis,
+    thread.evaluating = { id: evalId, threadKey: thread.key, triggerIds: chosen.map(trigger => trigger.id), primary: strongest.trigger.id, strength, actor, basis,
       policyVersion: policy.version, startedAt: at, deadline }
-    thread.pending = []
+    thread.pending = thread.pending.filter(id => !chosenIds.has(id))
     this.repo.threads.save(thread)
-    for (const trigger of triggers) {
+    for (const trigger of chosen) {
       this.repo.triggers.saveDisposition(trigger.id, { ...(this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at }), evalId })
     }
     this.emit('eval.started', { evalId, threadKey: thread.key, triggerIds: thread.evaluating.triggerIds, strength: strongest.strength })
@@ -152,7 +155,7 @@ export class Evals extends EnginePart {
     if (outcome.kind === 'accept' && evaluation.strength !== 'explicit' && !this.policy().admitsInferred(outcome.rules ?? [])) {
       throw new UserError('notExplicit')
     }
-    return this.decideEval(thread, evaluation, outcome)
+    return this.decideEval(thread, evaluation, outcome, triggerId)
   }
   /**
    * Queue a stored Trigger for a fresh Eval on its primary Thread and emit `trigger.requeued`; returns false while an Eval holds it.
@@ -279,7 +282,7 @@ export class Evals extends EnginePart {
       strength: gate.strength, actor: trigger.actor, basis: gate.basis, policyVersion: policy.version, startedAt: at, deadline: at }
   }
   /** Apply an outcome to an Eval of a Thread: the one in progress, or a gate-only one. */
-  private decideEval(thread: Thread, evaluation: Evaluation, outcome: AssessmentOutcome): Decision {
+  private decideEval(thread: Thread, evaluation: Evaluation, outcome: AssessmentOutcome, triggerId?: string): Decision {
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     // Requeue if Policy changed without a live policyChanged call (such as across an upgrade or restart).
     if (this.policy().version !== evaluation.policyVersion) {
@@ -300,19 +303,49 @@ export class Evals extends EnginePart {
       this.tickets.end(ticket.id, 'human', 'stopped', this.now(), typeof outcome.reason === 'string' ? outcome.reason : undefined)
       return decision
     }
-    return this.accept(thread, evaluation, outcome)
+    return this.accept(thread, evaluation, outcome, triggerId)
   }
-  /** Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. */
-  private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Decision {
+  /**
+   * Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. With `acceptBatch: 'primary'` only the
+   * Trigger being decided joins the ticket; the rest of its batch goes back to the queue for an Eval of their own.
+   */
+  private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, triggerId?: string): Decision {
     const at = this.now()
     const basis = { ...evaluation.basis, ...(outcome.rules ? { rules: outcome.rules } : {}) }
     const { strength, policyVersion, actor } = evaluation
     const mandate: Mandate = { strength, policyVersion, basis, actor, scope: outcome.scope }
     const ticketId = key('ticket', evaluation.id)
     const audit = outcome.audit ? { audit: outcome.audit } : {}
-    const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
-    this.tickets.create(ticketId, decision.id, mandate, evaluation, outcome, at)
+    const all = evaluation.triggerIds
+    const keep = this.options.acceptBatch === 'primary' && triggerId && all.includes(triggerId) ? [triggerId] : all
+    const rest = all.filter(id => !keep.includes(id))
+    const scoped = keep.length === all.length ? evaluation : { ...evaluation, triggerIds: keep }
+    const decision = this.finish(thread, scoped, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
+    this.tickets.create(ticketId, decision.id, mandate, { triggerIds: keep, primary: evaluation.primary ?? triggerId }, outcome, at)
+    if (rest.length) this.requeue(thread.key, rest)
     return decision
+  }
+  /** Put Triggers back at the head of their Thread's queue, as an accept that did not take them does. */
+  private requeue(threadKeyValue: string, ids: readonly string[]): void {
+    const thread = this.repo.threads.get(threadKeyValue)
+    if (!thread || !ids.length) return
+    thread.pending = [...ids, ...thread.pending.filter(id => !ids.includes(id))]
+    this.repo.threads.save(thread)
+    for (const id of ids) {
+      const disposition = this.repo.triggers.disposition(id)
+      if (disposition) this.repo.triggers.saveDisposition(id, { ...disposition, evalId: undefined, decisionId: undefined })
+    }
+  }
+  /**
+   * End the Eval that holds a Trigger whose routing command was refused, recording the refusal, so the Thread is not blocked
+   * until the assessment timeout. When the Eval holds other Triggers they are reassessed without it.
+   */
+  release(triggerId: string, reason: string): Decision | undefined {
+    const held = this.holding(triggerId)
+    if (!held?.evaluating) return undefined
+    const refusal: Reason = { code: 'notAttachable', values: { reason: reason.slice(0, 160) } }
+    if (held.evaluating.triggerIds.length === 1) return this.finish(held, held.evaluating, { kind: 'ignore', reason: [refusal] })
+    return this.reassess(held, refusal, [triggerId])
   }
   /** Record an Eval's Decision; the Thread's own Eval ends with it, while a gate-only one leaves the Thread's Eval going. */
   private finish(thread: Thread, evaluation: Evaluation, outcome: Finished): Decision {

@@ -71,7 +71,7 @@ test('a greeting must not resume a finished task', async () => {
   assert.equal(run.metrics.spuriousResumes, 1, 'a "谢谢" on a completed task\'s thread resumes it')
 })
 
-test('the card shows at most eight tickets, newest first, so older tasks fall off', async () => {
+test('the card keeps the eight most recent tickets and recalls older ones by keyword', async () => {
   const { Lab } = await import('../src/lab/session.ts')
   const lab = new Lab({ ownership: 'routed' })
   for (let index = 0; index < 10; index++) {
@@ -82,11 +82,104 @@ test('the card shows at most eight tickets, newest first, so older tasks fall of
       acknowledgement: '收到' }])
   }
   lab.advance(30_000)
-  const { trigger } = lab.receive({ text: '回到第一个任务' })
+  const { trigger } = lab.receive({ text: '回到第一个任务，发票报销' })
   lab.tick()
   const card = lab.card(trigger.id)!
-  assert.equal(card.related_tickets.length, 8, 'the card is capped at eight')
-  assert.equal(card.tickets_total, 10, 'but it says how many there are')
-  assert.equal(card.related_tickets.some(ticket => ticket.title === '任务 1'), false, 'the oldest is not on the card')
-  assert.equal(card.related_tickets.some(ticket => ticket.title === '任务 10'), true, 'the newest is')
+  const recent = card.related_tickets.filter(ticket => !ticket.recall)
+  const recalled = card.related_tickets.filter(ticket => ticket.recall === 'keyword')
+  assert.equal(recent.length, 8, 'the recent window stays eight')
+  assert.ok(recalled.length > 0 && recalled.length <= 4, 'older matches are recalled, capped at four')
+  assert.ok(recalled.some(ticket => ticket.title === '任务 1'), 'the oldest task is reachable again')
+  assert.equal(card.tickets_total, 10)
+})
+
+test('a query with no keyword overlap gets no recall, only the recent eight', async () => {
+  const { Lab } = await import('../src/lab/session.ts')
+  const lab = new Lab({ ownership: 'routed' })
+  for (let index = 0; index < 10; index++) {
+    lab.advance(30_000)
+    const { trigger } = lab.receive({ text: `第 ${index + 1} 个任务` })
+    lab.tick()
+    lab.route([{ kind: 'accept', trigger_id: trigger.id, title: `任务 ${index + 1}`, worktree_name: `task-${index + 1}`,
+      acknowledgement: '收到' }])
+  }
+  lab.advance(30_000)
+  const { trigger } = lab.receive({ text: 'zzz' })
+  lab.tick()
+  assert.equal(lab.card(trigger.id)!.related_tickets.length, 8)
+})
+
+test("acceptBatch: 'primary' keeps the rest of a batch out of the new ticket", async () => {
+  const { Lab } = await import('../src/lab/session.ts')
+  const lab = new Lab({ ownership: 'routed', acceptBatch: 'primary' })
+  const first = lab.receive({ text: '帮我查大阪机票' }).trigger
+  const second = lab.receive({ text: '帮我改周报' }).trigger
+  const third = lab.receive({ text: '帮我写道歉邮件' }).trigger
+  lab.tick()
+  lab.route([{ kind: 'accept', trigger_id: first.id, title: '大阪机票', worktree_name: 'osaka', acknowledgement: '收到' }])
+  assert.equal(lab.tickets().length, 1)
+  assert.deepEqual(lab.tickets()[0]!.origin.triggerIds, [first.id], 'only the decided Trigger joined')
+  assert.equal(lab.repo.threads.get(lab.threadKey)!.evaluating, undefined)
+  assert.deepEqual([...lab.repo.threads.get(lab.threadKey)!.pending].sort(), [second.id, third.id].sort())
+  lab.tick()
+  lab.route([{ kind: 'accept', trigger_id: second.id, title: '周报', worktree_name: 'weekly', acknowledgement: '收到' }])
+  lab.tick()
+  lab.route([{ kind: 'accept', trigger_id: third.id, title: '道歉邮件', worktree_name: 'apology', acknowledgement: '收到' }])
+  assert.equal(lab.tickets().length, 3)
+  assert.ok(lab.tickets().every(ticket => ticket.origin.triggerIds.length === 1))
+})
+
+test('a splitter keeps unrelated messages out of one Eval', async () => {
+  const { Lab } = await import('../src/lab/session.ts')
+  const { splitBatches } = await import('../src/routing/similarity.ts')
+  const lab = new Lab({ ownership: 'routed', batchSplitter: splitBatches })
+  const first = lab.receive({ text: '帮我查一下大阪机票' }).trigger
+  const second = lab.receive({ text: '大阪机票要周三出发' }).trigger
+  const third = lab.receive({ text: '帮我改周报模板' }).trigger
+  lab.tick()
+  const thread = lab.repo.threads.get(lab.threadKey)!
+  assert.deepEqual(thread.evaluating!.triggerIds, [first.id, second.id], 'the related pair shares one Eval')
+  assert.deepEqual(thread.pending, [third.id], 'the unrelated message waits for the next Eval')
+})
+
+test('the hashed embedding ranks a related title above an unrelated one', async () => {
+  const { embeddingSimilarity } = await import('../src/routing/embed.ts')
+  const related = embeddingSimilarity('大阪机票要周三出发', '大阪机票与酒店调研')
+  const unrelated = embeddingSimilarity('大阪机票要周三出发', '周报模板调整')
+  assert.ok(related > unrelated + 0.1, `${related} vs ${unrelated}`)
+})
+
+test('the vector cascade attaches an obvious continuation without calling the model', async () => {
+  const { embeddingCascade } = await import('../src/sim/variants.ts')
+  const { Lab } = await import('../src/lab/session.ts')
+  const lab = new Lab({ ownership: 'routed' })
+  const first = lab.receive({ text: '帮我查一下大阪机票' }).trigger
+  lab.tick()
+  lab.route([{ kind: 'accept', trigger_id: first.id, title: '大阪机票与酒店调研', worktree_name: 'osaka', acknowledgement: '收到' }])
+  const second = lab.receive({ text: '大阪机票要周三出发' }).trigger
+  lab.tick()
+  const card = lab.card(second.id)!
+  let called = false
+  const inner = { id: 'inner', label: 'inner', choose: () => { called = true; return { kind: 'accept' as const, title: 'x' } } }
+  const policy = embeddingCascade(inner, { answer: false })
+  const choice = await policy.choose(card, { text: '大阪机票要周三出发', task: 'x', intent: 'continue', taskTitle: () => 'x',
+    ticketsFor: () => [], taskOfTicket: () => undefined, history: ['帮我查一下大阪机票'] })
+  assert.equal(Array.isArray(choice) ? choice[0]!.kind : choice.kind, 'attach')
+  assert.equal(called, false, 'the model was not consulted')
+})
+
+test('acceptBatch primary lets three accepts in one call create three tickets', async () => {
+  const { Lab } = await import('../src/lab/session.ts')
+  const lab = new Lab({ ownership: 'routed', acceptBatch: 'primary' })
+  const first = lab.receive({ text: '帮我查大阪机票' }).trigger
+  const second = lab.receive({ text: '帮我改周报' }).trigger
+  const third = lab.receive({ text: '帮我写道歉邮件' }).trigger
+  lab.tick()
+  const accept = (triggerId: string, title: string, name: string) => ({ kind: 'accept', trigger_id: triggerId, title,
+    worktree_name: name, acknowledgement: '收到' })
+  const results = lab.route([accept(first.id, '大阪机票', 'osaka'), accept(second.id, '周报', 'weekly'), accept(third.id, '道歉邮件', 'apology')]) as Record<string, unknown>[]
+  assert.equal(results.length, 3)
+  assert.ok(results.every(result => result.decision === 'accept'), 'every item accepted')
+  assert.equal(lab.tickets().length, 3, 'one ticket each')
+  assert.ok(lab.tickets().every(ticket => ticket.origin.triggerIds.length === 1))
 })

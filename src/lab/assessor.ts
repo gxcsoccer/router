@@ -9,10 +9,25 @@ import { ticketCard } from '../routing/route-tool.ts'
 
 export type CandidateCard = ReturnType<typeof candidateCard>
 
-/** Trimmed copy of `relatedTickets`: open tickets first, newest first, at most eight. */
-export function relatedTickets(tickets: readonly Ticket[]) {
+/**
+ * The card's ticket list: the eight most recent, plus up to four older ones whose title shares a keyword with the message
+ * (`recall: 'keyword'`). The recent window alone loses task 9 and older; the keyword recall is the cheap "archive lookup".
+ */
+export function relatedTickets(tickets: readonly Ticket[], query = '') {
   const order = [...tickets].sort((a, b) => Number(!a.ended) === Number(!b.ended) ? b.createdAt.localeCompare(a.createdAt) : a.ended ? 1 : -1)
-  return { related_tickets: order.slice(0, 8).map(ticketCard), tickets_total: tickets.length }
+  const recent = order.slice(0, 8)
+  const words = new Set(keywordsOf(query))
+  const recalled = query
+    ? order.slice(8).filter(ticket => keywordsOf(ticket.title).some(keyword => words.has(keyword))).slice(0, 4)
+    : []
+  return {
+    related_tickets: [
+      ...recent.map(ticketCard),
+      ...recalled.map(ticket => ({ ...ticketCard(ticket), recall: 'keyword' as const })),
+    ],
+    tickets_total: tickets.length,
+    ...recalled.length ? { recalled } : {},
+  }
 }
 
 /** Card shapes the lab can hand the router: the full ticket cards, or a compact task index (title + keywords). */
@@ -55,7 +70,7 @@ export function candidateCard(candidate: Candidate, style: CardStyle = 'full') {
         .map(ticket => ({ ticket_id: ticket.id, title: ticket.title, keywords: keywordsOf(ticket.title),
           state: ticketCard(ticket).state })),
         tickets_total: candidate.tickets.length }
-      : relatedTickets(candidate.tickets),
+      : relatedTickets(candidate.tickets, primary.text),
     next_action: candidate.strength === 'explicit'
       ? 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.'
       : 'Ignore it with orchestrator_route if the card shows it touches no enabled rule; else assess it with orchestrator_eval, orchestrator_eval_read, then orchestrator_eval_decide.',

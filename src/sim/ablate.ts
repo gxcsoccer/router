@@ -37,6 +37,8 @@ const MATRIX: Record<string, string[]> = {
   v1: ['aime-a', 'aime-b'],
   v2: ['aime-a', 'aime-b'],
   v3: ['aime-a', 'aime-b'],
+  v3e: ['aime-a', 'aime-b'],
+  v8e: ['aime-a', 'aime-b'],
   v4: ['many-tasks'],
   v6: ['aime-a', 'aime-b'],
   v8: ['aime-a', 'aime-b'],

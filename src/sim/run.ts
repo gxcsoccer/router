@@ -9,6 +9,7 @@ import { SCENARIOS, type Message, type Scenario, type TaskSpec } from './scenari
 import { ROUTERS, type FollowUpNotice, type RouterChoice, type RouterContext, type RouterPolicy } from './router-policies.ts'
 import { Lab } from '../lab/session.ts'
 import { llmRouter, type LlmStats } from './llm.ts'
+import { splitBatches } from '../routing/similarity.ts'
 import type { Ticket } from '../core/index.ts'
 
 export type Ownership = 'thread' | 'routed'
@@ -84,6 +85,8 @@ export interface RunOptions {
   /** Ablation knobs, forwarded to the lab. */
   cardStyle?: 'full' | 'index'
   requireWorktreeName?: boolean
+  acceptBatch?: 'all' | 'primary'
+  batchSplitter?: (triggers: readonly import('../core/index.ts').Trigger[]) => readonly import('../core/index.ts').Trigger[]
 }
 
 export interface RunResult extends RunOptions {
@@ -98,7 +101,9 @@ const task = (scenario: Scenario, id: string): TaskSpec | undefined => scenario.
 export async function runScenario(options: RunOptions): Promise<RunResult> {
   const { scenario, ownership, router, worker } = options
   const lab = new Lab({ ownership, ...options.cardStyle ? { cardStyle: options.cardStyle } : {},
-    ...options.requireWorktreeName !== undefined ? { requireWorktreeName: options.requireWorktreeName } : {} })
+    ...options.requireWorktreeName !== undefined ? { requireWorktreeName: options.requireWorktreeName } : {},
+    ...options.acceptBatch ? { acceptBatch: options.acceptBatch } : {},
+    ...options.batchSplitter ? { batchSplitter: options.batchSplitter } : {} })
   const taskTickets = new Map<string, string[]>()
   const ticketTask = new Map<string, string>()
   const messageTask = new Map<string, string>()
@@ -149,9 +154,22 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     if (answered) lab.answer(triggerId, answered.text)
     const results = outcome
     const created = lab.tickets().map(ticket => ticket.id).filter(id => !before.has(id))
-    for (const id of created) {
-      ticketTask.set(id, message.task)
-      taskTickets.set(message.task, [...taskTickets.get(message.task) ?? [], id])
+    // A single call may create a ticket for a peer Trigger of the batch; attribute each ticket to the Trigger that made it.
+    const perTrigger = new Map<string, { decision?: string; ticketId?: string; refused?: string }>()
+    for (const result of results) {
+      // A refused item (an accept the batch already took) created nothing, and a swept ticket belongs to its own primary
+      // Trigger, not to every peer that a later item echoed back as "already accepted".
+      const ticketId = result.refused ? undefined : (result.ticket as { ticket_id?: string } | undefined)?.ticket_id
+      const ticket = ticketId ? lab.ticket(ticketId) : undefined
+      const owns = !!ticket && (ticket.origin.triggerIds.length === 1 || ticket.origin.triggerId === result.trigger_id)
+      perTrigger.set(result.trigger_id, { ...result.decision ? { decision: result.decision } : {},
+        ...ticketId && owns ? { ticketId } : {}, ...result.refused ? { refused: result.refused } : {} })
+    }
+    for (const [triggerId, info] of perTrigger) {
+      if (!info.ticketId || !created.includes(info.ticketId)) continue
+      const owner = messageTask.get(triggerId) ?? message.task
+      ticketTask.set(info.ticketId, owner)
+      taskTickets.set(owner, [...taskTickets.get(owner) ?? [], info.ticketId])
     }
     const own = results.find(result => result.trigger_id === triggerId)
     // A peer's refusal is not this message's; it is logged, but the row's verdict follows its own item.
@@ -161,7 +179,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       + `${created.length ? ` (new ${created[0]!.slice(0, 8)})` : ''}${refused ? ` [refused: ${refused}]` : ''}`)
     const kind = answered ? 'answer'
       : choices.find(choice => (choice.triggerId ?? triggerId) === triggerId)?.kind ?? choices.at(-1)?.kind
-    return { decision: own?.decision, refused, created, peerRefusals, kind }
+    return { decision: own?.decision, refused, created, peerRefusals, kind, perTrigger }
   }
   /** What the host steers into the main Session when a person's message already reached Tickets. */
   const followUp = (entry: { message: Message; triggerId: string }): FollowUpNotice | undefined => {
@@ -229,12 +247,20 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   if (burst) {
     for (const [index, message] of scenario.messages.entries()) receive(message, index)
     lab.tick()
-    let decided = false
+    // A burst is one arrival; with a splitter or a primary-only accept each message gets its own Eval, so keep passing.
+    const peer = new Map<string, { decision?: string; ticketId?: string; refused?: string }>()
     for (const entry of received) {
-      if (decided) { rows.push(row(entry, undefined, false)); continue }
-      const outcome = await routeOnce(entry.message, entry.triggerId)
-      rows.push(row(entry, outcome, false))
-      decided = outcome?.decision === 'accept'
+      if (!lab.card(entry.triggerId)) lab.tick()
+      if (lab.card(entry.triggerId)) {
+        const outcome = await routeOnce(entry.message, entry.triggerId)
+        for (const [id, info] of outcome?.perTrigger ?? []) peer.set(id, info)
+      }
+      const info = peer.get(entry.triggerId)
+      const outcome = info
+        ? { decision: info.decision, refused: info.refused, created: info.ticketId ? [info.ticketId] : [], kind: info.decision ? 'accept' : 'attach' }
+        : undefined
+      rows.push(row(entry, outcome as never, false))
+      lab.tick()
     }
   } else {
     for (const [index, message] of scenario.messages.entries()) {
@@ -345,18 +371,22 @@ async function main(argv: string[]): Promise<void> {
   const ownershipArg = argv.includes('--ownership') ? argv[argv.indexOf('--ownership') + 1] as Ownership : undefined
   const routerArg = argv.includes('--router') ? argv[argv.indexOf('--router') + 1] : undefined
   const modelArg = argv.includes('--model') ? argv[argv.indexOf('--model') + 1] : undefined
+  const split = argv.includes('--split')
+  const acceptArg = argv.includes('--accept') ? argv[argv.indexOf('--accept') + 1] as 'all' | 'primary' : undefined
+  const knobs = { ...split ? { batchSplitter: splitBatches } : {}, ...acceptArg ? { acceptBatch: acceptArg } : {} }
   const modes: Ownership[] = ownershipArg ? [ownershipArg] : ['thread', 'routed']
+  const only = argv.includes('--only') ? argv[argv.indexOf('--only') + 1] : undefined
   let stats: LlmStats | undefined
   const routers: readonly RouterPolicy[] = routerArg === 'llm'
     ? [await (async () => { const router = await llmRouter({ model: modelArg, trace: argv.includes('--trace') }); stats = router.stats; return router })()]
     : routerArg ? ROUTERS.filter(router => router.id === routerArg) : ROUTERS
   const lines: string[] = []
-  for (const scenario of SCENARIOS) {
+  for (const scenario of SCENARIOS.filter(item => !only || item.id === only)) {
     for (const ownership of modes) {
       lines.push(`\n### ${scenario.title} · ownership=${ownership}\n`)
       const body: string[][] = []
       for (const router of routers) {
-        const run = await runScenario({ scenario, ownership, router, worker: 'diligent' })
+        const run = await runScenario({ scenario, ownership, router, worker: 'diligent', ...knobs })
         const m = run.metrics
         body.push([router.label, `${m.correct}/${m.messages} (${pct(m.correct, m.messages)})`, `${m.unseen}`, `${m.leaked}`,
           `${m.fragmented}`, `${m.duplicated}`, `${m.lost}`, `${m.tickets}/${m.expectedTasks}`, `${m.resumes}/${m.spuriousResumes}`,
@@ -367,7 +397,7 @@ async function main(argv: string[]): Promise<void> {
   }
   const headline = SCENARIOS[0]!
   for (const [ownership, router] of [['thread', ROUTERS[0]!], ['routed', ROUTERS[0]!], ['routed', ROUTERS[1]!]] as const) {
-    const run = await runScenario({ scenario: headline, ownership, router, worker: 'diligent' })
+    const run = await runScenario({ scenario: headline, ownership, router, worker: 'diligent', ...knobs })
     lines.push(`\n### 明细 · ${ownership} · ${router.label}\n`)
     lines.push(detail(run))
   }

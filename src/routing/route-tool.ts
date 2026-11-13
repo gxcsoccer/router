@@ -121,6 +121,8 @@ export interface RouteHost {
   requestPass(): void
   /** Run an Engine command initiated by the main Session without emitting self-notifications. */
   quietly<T>(run: () => T): T
+  /** End the Eval still holding a Trigger whose command was refused, so the Thread can take the next message. */
+  release?(triggerId: string, reason: string): unknown
 }
 
 /** The ticket projection a routing result carries (`ticketCard` in dsh-superagent, trimmed to the routing fields). */
@@ -200,7 +202,11 @@ export function executeRoute(host: RouteHost, input: unknown, options: RouteTool
       return { ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
         ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
     } catch (error) {
-      if (error instanceof UserError) return { ...head, refused: error.message }
+      if (error instanceof UserError) {
+        // A refused command must not leave the Eval open: the Thread would stop taking messages until its deadline.
+        try { host.release?.(item.trigger_id, error.message) } catch { /* the refusal is what the caller needs */ }
+        return { ...head, refused: error.message }
+      }
       return { ...head, refused: `Not recorded: ${error instanceof Error ? error.message : String(error)}; retry this item` }
     }
   })

@@ -107,17 +107,30 @@ export class Engine {
    * @throws UserError for a ticket a person stopped, which withdrew its Mandate, or one whose Mandate the Policy no longer holds.
    */
   attach(ticketId: string, triggerId: string, note?: string): Ticket {
-    return this.repo.atomic(() => {
-      // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
-      const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
-      if (handedBack) throw new UserError('handedBackHere')
-      const trigger = this.tickets.attachable(ticketId, triggerId)
-      this.evals.withdraw(trigger)
-      this.tickets.attach(ticketId, trigger, note)
-      this.evals.routed(triggerId, ticketId)
-      this.tickets.wake(ticketId)
-      return this.repo.tickets.get(ticketId)!
-    })
+    try {
+      return this.repo.atomic(() => {
+        // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
+        const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
+        if (handedBack) throw new UserError('handedBackHere')
+        const trigger = this.tickets.attachable(ticketId, triggerId)
+        this.evals.withdraw(trigger)
+        this.tickets.attach(ticketId, trigger, note)
+        this.evals.routed(triggerId, ticketId)
+        this.tickets.wake(ticketId)
+        return this.repo.tickets.get(ticketId)!
+      })
+    } catch (error) {
+      // The refused transaction rolled back; release the Eval in a second one so the Thread can take the next message.
+      if (error instanceof UserError) this.releaseRouting(triggerId, error.message)
+      throw error
+    }
+  }
+  /**
+   * End the Eval that holds a Trigger whose routing command was refused, so the Thread is not blocked until its assessment
+   * deadline. A host calls it after a refused `orchestrator_route` item; `attach` calls it for its own refusals.
+   */
+  releaseRouting(triggerId: string, reason: string): Decision | undefined {
+    return this.repo.atomic(() => this.evals.release(triggerId, reason))
   }
   /**
    * Ask a running worker that waits in `waiting` state for its status; any other worker is left alone.
@@ -260,7 +273,8 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'
+  | 'releaseRouting'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

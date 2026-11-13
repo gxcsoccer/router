@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/workspace/router
-node --experimental-transform-types --no-warnings --test test/*.spec.ts   # 30 个测试
+node --experimental-transform-types --no-warnings --test test/*.spec.ts   # 37 个测试
 node --experimental-transform-types --no-warnings src/sim/run.ts          # 个人助理场景评测（规则策略）
 node --experimental-transform-types --no-warnings src/sim/run.ts --router llm --model deepseek-flash   # 真实模型
 node --experimental-transform-types --no-warnings src/sim/sweep.ts --model deepseek-flash --repeat 3 \
@@ -105,6 +105,10 @@ docs/findings.md     在 personal agent 场景下的评测结论
 - resume：attach 到已结束且 Mandate 仍有效的票会唤醒它；人停过的票不醒。
 - 工具：逐项校验、逐项执行、顺序与入参一致；一项被拒不影响其余；每次调用请求一次 pass。
 - 已知缝隙（测试如实记录）：`attach` 不登记批内 `decided`，同一 call 里后续的 `ignore` 会落到 Engine —— 但此时票已拥有该消息，`leftToWorkers` 会拒绝，因此不会产生第二条 Decision。
+- 被拒的路由命令会释放 Eval（`ignore{notAttachable}`），不再把整个 Thread 锁到超时。
+- `acceptBatch: 'primary'` 让一条 accept 只接收自己的 Trigger；`batchSplitter`（`splitBatches`）在同批到达时按相似度切分。
+- 卡片召回：最近 8 张 + 关键词命中的旧票（≤4）。
+- 向量级联（`embeddingCascade`）实现完成但实测更差，默认关闭；见 `docs/ablation.md` 第 8 节。
 
 ## 接入自己的运行时
 
