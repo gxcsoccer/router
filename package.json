@@ -1,0 +1,38 @@
+{
+  "name": "dsh-superagent-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The routing half of dsh-superagent, extracted: Trigger intake, Thread-level Eval batching, Decision (accept/attach/ignore/stop), Ticket creation and the orchestrator_route tool. Zero runtime dependencies; runs on Node's TypeScript type stripping.",
+  "type": "module",
+  "exports": {
+    ".": "./src/core/index.ts",
+    "./routing": "./src/routing/route-tool.ts",
+    "./lab": "./src/lab/session.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --no-warnings --test test/*.spec.ts",
+    "sim": "node --experimental-transform-types --no-warnings src/sim/run.ts",
+    "sim:llm": "node --experimental-transform-types --no-warnings src/sim/run.ts --router llm --model deepseek-flash",
+    "sim:sweep": "node --experimental-transform-types --no-warnings src/sim/sweep.ts --model deepseek-flash --repeat 3 --scenarios personal-chat,many-tasks,twin-subjects,long-stream",
+    "sim:aime": "node --experimental-transform-types --no-warnings src/sim/aime-eval.ts --mode windows --router llm",
+    "sim:aime:stream": "node --experimental-transform-types --no-warnings src/sim/aime-eval.ts --mode stream --from 1 --to 60 --router llm",
+    "sim:ablate": "node --experimental-transform-types --no-warnings src/sim/ablate.ts --model deepseek-flash --out docs/ablation-raw.md",
+    "sim:markdown": "node --experimental-transform-types --no-warnings src/sim/run.ts --markdown"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gxcsoccer/router.git"
+  },
+  "keywords": [
+    "agent",
+    "router",
+    "task-routing",
+    "deepseek",
+    "personal-agent",
+    "evaluation"
+  ]
+}
